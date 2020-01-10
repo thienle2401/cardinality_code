@@ -1,0 +1,168 @@
+---
+title: "Cardinality Coding"
+output: html_notebook
+---
+
+Load nessessary packages and the provided data. While Excel based format is not ideal, but data seems to be simple enough, reading the data directly from provided Excel file.
+
+```{r message=FALSE}
+library(readxl)
+library(data.table)
+library(janitor)
+library(scales)
+library(radiant.data)
+library(dplyr)
+
+DATA_PATH <- "data/RFM_Analysis.xlsx"
+file_sheets <- excel_sheets(DATA_PATH)
+
+# load all data from all worksheets
+data <- lapply(file_sheets, function(sheet, data_path){
+  
+  sheet_data <- read_xlsx(data_path, sheet)
+  setDT(sheet_data)
+  setnames(sheet_data, make_clean_names(names(sheet_data), case = "snake"))
+  
+}, data_path = DATA_PATH)
+
+# name each dataset according to name of the worksheet
+names(data) <- file_sheets
+```
+
+
+All worksheets in the Excel should now be loaded, have a quick preview of the data to make sure that everything looks good:
+
+```{r paged.print=FALSE}
+print(data)
+```
+
+Loaded data looks correct and everything seems to be fine. the data has been pre-processed. I have a feeling that these four datasets come from a same data input, and then RFM analysis were performed.
+
+Having the wild guess above, then `msisdn`, `date_most_recent`, `transaction_count`, `recency_score`, and `frequency_score` should be identical among these four datasets. But need to confirm this:
+
+```{r}
+
+#' An ultility to check if all data.frame in a list are identical
+#'
+#' @param data A list of data.frame and with length(data) > 1
+#' @param cols A character vector, which specified the columns which should be used to check identicality among data.frame
+#'
+#' @return Logical. TRUE if all data.frame with specified columns are identical otherwise FALSE
+check_all_equal <- function(data, cols){
+  
+  x1 <- data[[1]][, ..cols]
+  x2 <- data[[2]][, ..cols]
+  
+  setorderv(x1, cols)
+  setorderv(x2, cols)
+  
+  if(!all(x1 == x2)) return(FALSE) else data[[2]] <- NULL
+  if(length(data) != 1) check_all_equal(data, cols)
+  
+  return(TRUE)
+  
+}
+
+data_keys <- c("msisdn", "date_most_recent", "recency_score", "frequency_score", "transaction_count")
+
+sprintf("All data.frame in the list are identical: %s", check_all_equal(data, data_keys))
+```
+
+It is true that `msisdn`, `date_most_recent`, `transaction_count`, `recency_score`, and `frequency_score` are identical between the datasets, so we can use them a as keys to join all these datastes. This is a very ideal situtation :D, but as the data is already prepared, so I can move on next steps without spending much time here.
+
+Next, `monetary_score` field is removed from each individual dataset and rename `amount` field to be unique after joined all the datasets. Subsequently, all four datasets are joined to produce a single dataset.
+
+```{r paged.print=FALSE}
+
+# remove monetary_score and add prefix for corresponding dataset
+# these operations are by references, so minimal cost
+data[["monetary_uplink"]][, c("monetary_score", "rfm_score") := NULL]
+setnames(data[["monetary_uplink"]], "amount", "ul_vl_amount")
+
+data[["monetary_downlink"]][, c("monetary_score", "rfm_score") := NULL]
+setnames(data[["monetary_downlink"]], "amount", "dl_vl_amount")
+
+data[["monetary_uplinkRTT"]][, c("monetary_score", "rfm_score") := NULL]
+setnames(data[["monetary_uplinkRTT"]], "amount", "ul_rtt_amount")
+
+data[["monetary_downlinkRTT"]][, c("monetary_score", "rfm_score") := NULL]
+setnames(data[["monetary_downlinkRTT"]], "amount", "dl_rtt_amount")
+
+
+# define the keys, which shall be used to join up all datasets
+data_keys <- c("msisdn", "date_most_recent", "recency_score", "frequency_score", "transaction_count")
+
+# set keys for each indivudal dataset
+setkeyv(data[["monetary_uplink"]], data_keys)
+setkeyv(data[["monetary_downlink"]], data_keys)
+setkeyv(data[["monetary_uplinkRTT"]], data_keys)
+setkeyv(data[["monetary_downlinkRTT"]], data_keys)
+
+# join all datasets
+combined_ds <- Reduce(merge, data)
+
+# inspect few rows of the combined dataset
+combined_ds[1:10, ]
+```
+
+
+The new dataset looks good, and we now have `ul_vl_amount`, `dl_vl_amount`, `ul_rtt_amount` and `dl_rtt_amount` for each `msisdn` on a same row in a single dataset. 
+With the provided information and dendogram, I decided to start with user-defined weighted objective function. The weighs for each feature to start with as follow from visual intepreation of the dendogram:
+
+* **ul_vl_amount**: 0.15  
+* **dl_vl_amount**: 0.3  
+* **ul_rtt_amount**: 0.5  
+* **dl_rtt_amount**: 0.05  
+
+
+```{r}
+#' Calcuate objective value for a given matrix 
+#'
+#' @param x A named matrix
+#'
+#' @return Numeric vector. Computeted objective value for each row of the input matrix with defined logic 
+obj_fun_5G_likeability <- function(x){
+  
+  # weights defined by user
+  weights <- c(
+    "ul_vl_amount" = 0.15,
+    "dl_vl_amount" = 0.3,
+    "ul_rtt_amount" = 0.5,
+    "dl_rtt_amount" = 0.05
+  )
+  
+  # scale all values between [0..1] before compute objective value
+  scaled_x <- do.call(cbind, lapply(x, rescale))
+  
+  
+  # we need to reresve the direction of RRT, so the lower is better, and then
+  # contribute more to the final objective value
+  scaled_x[, "dl_rtt_amount"] <- 1 - scaled_x[, "dl_rtt_amount"]
+  scaled_x[, "ul_rtt_amount"] <- 1 - scaled_x[, "ul_rtt_amount"]
+  
+  # compute weighted value for each feature (column)
+  obj_val <- scaled_x %*% diag(weights[colnames(scaled_x)])
+
+  # return vector of objective values for the input on matrix
+  rowSums(obj_val)
+}
+
+
+combined_ds[, unfied_amount := obj_fun_5G_likeability(.SD), .SDcols = c("ul_vl_amount", "dl_vl_amount", "ul_rtt_amount", "dl_rtt_amount")]
+
+# create quantiles for the newly created metric, so we
+# can bring it into the context of RFM analysis if needed
+combined_ds[, unified_monetary_score := xtile(unfied_amount, 5)]
+
+```
+
+So, the combined dataset with an unified objective metric was procuded as in the above code. We can preview few rows of the final dataset:
+
+```{r}
+combined_ds[order(-recency_score, -frequency_score, -unified_monetary_score, -unfied_amount)][1:10]
+```
+
+## Other Thoughts
+The objective function, `obj_fun_5G_likeability(...)` is probably oversimplified but I think that itcan be considered as a starting point as well as meeting the requirement of the assignment. Ideally, we should have more positive example, so we can go further to optimise the coffecients for each features (which were already identified as most sigficant features)
+
+I hope that I have delivered what you wished to see from my end for this assignment. If there are any queries, please feel free to let me know. 
